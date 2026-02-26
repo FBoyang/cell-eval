@@ -12,6 +12,7 @@ def guess_is_lognorm(
     epsilon: float = 1e-3,
     max_threshold: float = 15.0,
     validate: bool = True,
+    min_tolerance: float = 0.0,
 ) -> bool:
     """Guess if the input is integer counts or log-normalized.
 
@@ -23,13 +24,14 @@ def guess_is_lognorm(
         epsilon: Threshold for detecting fractional values (default 1e-3)
         max_threshold: Maximum valid value for log1p normalized data (default 15.0)
         validate: Whether to validate the data is in valid log1p range (default True)
+        min_tolerance: Allow min value >= -min_tolerance when validating (default 0)
 
     Returns:
         bool: True if the input is lognorm, False if integer counts
 
     Raises:
         ValueError: If data has decimal values but falls outside
-            valid log1p range (min < 0 or max >= max_threshold), indicating mixed or invalid scales
+            valid log1p range (min < -min_tolerance or max >= max_threshold), indicating mixed or invalid scales
     """
     if adata.X is None:
         raise ValueError("adata.X is None")
@@ -52,6 +54,9 @@ def guess_is_lognorm(
         return False
 
     # Data has decimals - perform validation if requested
+    if not validate:
+        return True
+
     # Validate it's in valid log1p range
     if isinstance(adata.X, csr_matrix) or isinstance(adata.X, csc_matrix):
         max_val = adata.X.max()
@@ -60,14 +65,13 @@ def guess_is_lognorm(
         max_val = float(np.max(adata.X))
         min_val = float(np.min(adata.X))
 
-    # Validate range
-    if min_val < 0:
+    if min_val < -min_tolerance:
         raise ValueError(
             f"Invalid scale: min value {min_val:.2f} is negative. "
             f"Both Natural or Log1p normalized data must have all values >= 0."
         )
 
-    if validate and max_val >= max_threshold:
+    if max_val >= max_threshold:
         raise ValueError(
             f"Invalid scale: max value {max_val:.2f} exceeds log1p threshold of {max_threshold}. "
             f"Expected log1p normalized values in range [0, {max_threshold}), but found values suggesting "
@@ -75,7 +79,6 @@ def guess_is_lognorm(
             f"(some cells with raw counts, some with log1p values)."
         )
 
-    # Valid log1p data
     logger.info(
         f"Data appears to be log1p normalized (decimals detected, range [{min_val:.2f}, {max_val:.2f}])"
     )
