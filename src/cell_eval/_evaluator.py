@@ -317,6 +317,24 @@ def _load_or_build_de(
             adata=anndata_pair.real if mode == "real" else anndata_pair.pred,
             **pdex_kwargs,
         )
+        # Sanitize p_value for FDR: log invalid rows to outdir (summary-stats dir), then either drop (real) or treat as non-DE (pred)
+        valid_p = (pl.col("p_value") >= 0) & (pl.col("p_value") <= 1)
+        n_invalid = frame.filter(~valid_p).height
+        if n_invalid > 0:
+            invalid_rows = frame.filter(~valid_p)
+            if outdir is not None:
+                _prefix = prefix.replace("/", "-") if prefix else None
+                log_name = f"{_prefix}_{mode}_de_invalid_pvalues.csv" if _prefix else f"{mode}_de_invalid_pvalues.csv"
+                log_path = os.path.join(outdir, log_name)
+                invalid_rows.write_csv(log_path)
+                logger.info(f"Logged {n_invalid} rows with invalid p_value to {log_path}")
+            if mode == "real":
+                frame = frame.filter(valid_p)
+            else:
+                # pred: keep rows but set invalid p_value to 1.0 so perturbation is treated as non-DE
+                frame = frame.with_columns(
+                    pl.when(valid_p).then(pl.col("p_value")).otherwise(1.0).alias("p_value")
+                )
         if outdir is not None:
             if prefix is not None:
                 prefix = prefix.replace(
