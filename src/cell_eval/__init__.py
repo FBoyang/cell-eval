@@ -2,6 +2,7 @@ from ._baseline import build_base_mean_adata
 from ._evaluator import MetricsEvaluator
 from ._pipeline import KNOWN_PROFILES, MetricPipeline
 from ._score import score_agg_metrics
+from ._systema import compute_systema_de
 from ._types import (
     BulkArrays,
     CellArrays,
@@ -17,6 +18,8 @@ from .metrics import metrics_registry
 __all__ = [
     # Evaluation
     "MetricsEvaluator",
+    # Systema (residual-DE)
+    "compute_systema_de",
     # Baseline
     "build_base_mean_adata",
     # Scoring

@@ -12,6 +12,7 @@ from pdex import parallel_differential_expression
 from cell_eval.utils import guess_is_lognorm
 
 from ._pipeline import MetricPipeline
+from ._systema import compute_systema_de
 from ._types import PerturbationAnndataPair, initialize_de_comparison
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,8 @@ class MetricsEvaluator:
     pdex_kwargs: dict[str, Any] | None = None
         Keyword arguments for parallel_differential_expression.
         These will overwrite arguments passed to MetricsEvaluator.__init__ if they conflict.
+    de_mode: str = "standard"
+        DE computation mode: "standard" (pdex), "systema" (residual-DE), or "both".
     """
 
     def __init__(
@@ -71,6 +74,7 @@ class MetricsEvaluator:
         prefix: str | None = None,
         pdex_kwargs: dict[str, Any] | None = None,
         skip_de: bool = False,
+        de_mode: str = "standard",
     ):
         # Enable a global string cache for categorical columns
         pl.enable_string_cache()
@@ -81,6 +85,11 @@ class MetricsEvaluator:
             )
         os.makedirs(outdir, exist_ok=True)
 
+        de_mode = de_mode.lower().strip()
+        if de_mode not in ("standard", "systema", "both"):
+            raise ValueError(f"de_mode must be 'standard', 'systema', or 'both', got {de_mode!r}")
+
+        self.de_mode = de_mode
         self.anndata_pair = _build_anndata_pair(
             real=adata_real,
             pred=adata_pred,
@@ -88,11 +97,14 @@ class MetricsEvaluator:
             pert_col=pert_col,
             allow_discrete=allow_discrete,
         )
+        self.anndata_pair_systema = None
+        self.de_comparison = None
+        self.de_comparison_systema = None
 
         if skip_de:
-            self.de_comparison = None
-        else:
-            self.de_comparison = _build_de_comparison(
+            pass
+        elif de_mode in ("standard", "both"):
+            self.de_comparison, self.anndata_pair = _build_de_comparison(
                 anndata_pair=self.anndata_pair,
                 de_pred=de_pred,
                 de_real=de_real,
@@ -104,6 +116,15 @@ class MetricsEvaluator:
                 prefix=prefix,
                 pdex_kwargs=pdex_kwargs or {},
             )
+        if not skip_de and de_mode in ("systema", "both"):
+            sys_prefix = f"{prefix}_systema" if prefix else "systema"
+            self.de_comparison_systema, self.anndata_pair_systema = _build_systema_comparison(
+                anndata_pair=self.anndata_pair,
+                outdir=outdir,
+                prefix=sys_prefix,
+            )
+            if de_mode == "systema":
+                self.anndata_pair = self.anndata_pair_systema
 
         self.outdir = outdir
         self.prefix = prefix
@@ -116,6 +137,68 @@ class MetricsEvaluator:
         basename: str = "results.csv",
         write_csv: bool = True,
         break_on_error: bool = False,
+    ) -> tuple[pl.DataFrame, pl.DataFrame] | tuple[tuple[pl.DataFrame, pl.DataFrame], tuple[pl.DataFrame, pl.DataFrame]]:
+        if self.de_comparison_systema is None:
+            return self._compute_single(
+                profile=profile,
+                metric_configs=metric_configs,
+                skip_metrics=skip_metrics,
+                basename=basename,
+                write_csv=write_csv,
+                break_on_error=break_on_error,
+                de_comparison=self.de_comparison,
+                anndata_pair=self.anndata_pair,
+                suffix="_standard",
+            )
+        if self.de_comparison is None:
+            # Systema-only mode
+            return self._compute_single(
+                profile=profile,
+                metric_configs=metric_configs,
+                skip_metrics=skip_metrics,
+                basename=basename,
+                write_csv=write_csv,
+                break_on_error=break_on_error,
+                de_comparison=self.de_comparison_systema,
+                anndata_pair=self.anndata_pair_systema,
+                suffix="_systema",
+            )
+        # Both modes: run standard and systema separately, each with its own AnnData metrics on the matching pair
+        results_std, agg_std = self._compute_single(
+            profile=profile,
+            metric_configs=metric_configs,
+            skip_metrics=skip_metrics,
+            basename=basename,
+            write_csv=write_csv,
+            break_on_error=break_on_error,
+            de_comparison=self.de_comparison,
+            anndata_pair=self.anndata_pair,
+            suffix="_standard",
+        )
+        results_sys, agg_sys = self._compute_single(
+            profile=profile,
+            metric_configs=metric_configs,
+            skip_metrics=skip_metrics,
+            basename=basename,
+            write_csv=write_csv,
+            break_on_error=break_on_error,
+            de_comparison=self.de_comparison_systema,
+            anndata_pair=self.anndata_pair_systema,
+            suffix="_systema",
+        )
+        return (results_std, agg_std), (results_sys, agg_sys)
+
+    def _compute_single(
+        self,
+        profile: Literal["full", "vcc", "minimal", "de", "anndata"],
+        metric_configs: dict[str, dict[str, Any]] | None,
+        skip_metrics: list[str] | None,
+        basename: str,
+        write_csv: bool,
+        break_on_error: bool,
+        de_comparison: Any,
+        anndata_pair: PerturbationAnndataPair | None,
+        suffix: str,
     ) -> tuple[pl.DataFrame, pl.DataFrame]:
         pipeline = MetricPipeline(
             profile=profile,
@@ -124,32 +207,26 @@ class MetricsEvaluator:
         )
         if skip_metrics is not None:
             pipeline.skip_metrics(skip_metrics)
-        pipeline.compute_de_metrics(self.de_comparison)
-        pipeline.compute_anndata_metrics(self.anndata_pair)
+        pipeline.compute_de_metrics(de_comparison)
+        pipeline.compute_anndata_metrics(anndata_pair)
         results = pipeline.get_results()
         agg_results = pipeline.get_agg_results()
 
-        if write_csv:
-            if self.prefix is not None:
-                self.prefix = self.prefix.replace(
-                    "/", "-"
-                )  # some prefixes (e.g. HepG2/C3A) may have slashes in them
-            if basename is not None:
-                basename = basename.replace(
-                    "/", "-"
-                )  # some basenames (e.g. HepG2/C3A_results.csv) may have slashes in them
+        if write_csv and basename:
+            _prefix = ((self.prefix or "") + suffix).strip()
+            if _prefix:
+                _prefix = _prefix.replace("/", "-")
+            _basename = basename.replace("/", "-")
             outpath = os.path.join(
                 self.outdir,
-                f"{self.prefix}_{basename}" if self.prefix else basename,
+                f"{_prefix}_{_basename}" if _prefix else _basename,
             )
             agg_outpath = os.path.join(
                 self.outdir,
-                f"{self.prefix}_agg_{basename}" if self.prefix else f"agg_{basename}",
+                f"{_prefix}_agg_{_basename}" if _prefix else f"agg_{_basename}",
             )
-
             logger.info(f"Writing perturbation level metrics to {outpath}")
             results.write_csv(outpath)
-
             logger.info(f"Writing aggregate metrics to {agg_outpath}")
             agg_results.write_csv(agg_outpath)
 
@@ -234,32 +311,116 @@ def _build_de_comparison(
     prefix: str | None = None,
     pdex_kwargs: dict[str, Any] | None = None,
 ):
-    return initialize_de_comparison(
-        real=_load_or_build_de(
-            mode="real",
-            de_path=de_real,
-            anndata_pair=anndata_pair,
-            de_method=de_method,
-            num_threads=num_threads,
-            batch_size=batch_size,
-            allow_discrete=allow_discrete,
-            outdir=outdir,
-            prefix=prefix,
-            pdex_kwargs=pdex_kwargs or {},
-        ),
-        pred=_load_or_build_de(
-            mode="pred",
-            de_path=de_pred,
-            anndata_pair=anndata_pair,
-            de_method=de_method,
-            num_threads=num_threads,
-            batch_size=batch_size,
-            allow_discrete=allow_discrete,
-            outdir=outdir,
-            prefix=prefix,
-            pdex_kwargs=pdex_kwargs or {},
-        ),
+    if anndata_pair is None:
+        raise ValueError("anndata_pair must be provided")
+
+    real_frame = _load_or_build_de(
+        mode="real",
+        de_path=de_real,
+        anndata_pair=anndata_pair,
+        de_method=de_method,
+        num_threads=num_threads,
+        batch_size=batch_size,
+        allow_discrete=allow_discrete,
+        outdir=outdir,
+        prefix=prefix,
+        pdex_kwargs=pdex_kwargs or {},
     )
+    pred_frame = _load_or_build_de(
+        mode="pred",
+        de_path=de_pred,
+        anndata_pair=anndata_pair,
+        de_method=de_method,
+        num_threads=num_threads,
+        batch_size=batch_size,
+        allow_discrete=allow_discrete,
+        outdir=outdir,
+        prefix=prefix,
+        pdex_kwargs=pdex_kwargs or {},
+    )
+
+    # Drop perturbations where real has zero significant genes (FDR < 0.05), and log them.
+    fdr_threshold = 0.05
+    sig_counts = (
+        real_frame.group_by("target")
+        .agg((pl.col("fdr") < fdr_threshold).sum().alias("n_sig"))
+    )
+    no_de = sig_counts.filter(pl.col("n_sig") == 0).select("target").to_series().to_list()
+    if len(no_de) > 0:
+        if outdir is not None:
+            _prefix = prefix.replace("/", "-") if prefix else None
+            log_name = (
+                f"{_prefix}_real_no_de_perturbations.csv"
+                if _prefix
+                else "real_no_de_perturbations.csv"
+            )
+            sig_counts.filter(pl.col("target").is_in(no_de)).write_csv(
+                os.path.join(outdir, log_name)
+            )
+
+        # Filter DE frames
+        real_frame = real_frame.filter(~pl.col("target").is_in(no_de))
+        pred_frame = pred_frame.filter(~pl.col("target").is_in(no_de))
+
+        # Filter AnnData and rebuild PerturbationAnndataPair to keep masks/caches consistent
+        pert_col = anndata_pair.pert_col
+        ctrl = anndata_pair.control_pert
+        mask_real = (~anndata_pair.real.obs[pert_col].isin(no_de)) | (anndata_pair.real.obs[pert_col] == ctrl)
+        mask_pred = (~anndata_pair.pred.obs[pert_col].isin(no_de)) | (anndata_pair.pred.obs[pert_col] == ctrl)
+        anndata_pair = PerturbationAnndataPair(
+            real=anndata_pair.real[mask_real].copy(),
+            pred=anndata_pair.pred[mask_pred].copy(),
+            pert_col=pert_col,
+            control_pert=ctrl,
+            embed_key=anndata_pair.embed_key,
+        )
+
+    return initialize_de_comparison(real=real_frame, pred=pred_frame), anndata_pair
+
+
+def _build_systema_comparison(
+    anndata_pair: PerturbationAnndataPair,
+    outdir: str | None = None,
+    prefix: str | None = None,
+):
+    """Build DEComparison from residual-DE (systema) on real and pred; filter zero-DE perturbations."""
+    real_frame = compute_systema_de(
+        anndata_pair.real,
+        pert_col=anndata_pair.pert_col,
+        control_pert=anndata_pair.control_pert,
+    )
+    pred_frame = compute_systema_de(
+        anndata_pair.pred,
+        pert_col=anndata_pair.pert_col,
+        control_pert=anndata_pair.control_pert,
+    )
+    fdr_threshold = 0.05
+    sig_counts = (
+        real_frame.group_by("target")
+        .agg((pl.col("fdr") < fdr_threshold).sum().alias("n_sig"))
+    )
+    no_de = sig_counts.filter(pl.col("n_sig") == 0).select("target").to_series().to_list()
+    if len(no_de) > 0:
+        if outdir is not None and prefix is not None:
+            _prefix = prefix.replace("/", "-")
+            log_name = f"{_prefix}_real_no_de_perturbations.csv"
+            sig_counts.filter(pl.col("target").is_in(no_de)).write_csv(
+                os.path.join(outdir, log_name)
+            )
+        real_frame = real_frame.filter(~pl.col("target").is_in(no_de))
+        pred_frame = pred_frame.filter(~pl.col("target").is_in(no_de))
+        pert_col = anndata_pair.pert_col
+        ctrl = anndata_pair.control_pert
+        mask_real = (~anndata_pair.real.obs[pert_col].isin(no_de)) | (anndata_pair.real.obs[pert_col] == ctrl)
+        mask_pred = (~anndata_pair.pred.obs[pert_col].isin(no_de)) | (anndata_pair.pred.obs[pert_col] == ctrl)
+        anndata_pair = PerturbationAnndataPair(
+            real=anndata_pair.real[mask_real].copy(),
+            pred=anndata_pair.pred[mask_pred].copy(),
+            pert_col=pert_col,
+            control_pert=ctrl,
+            embed_key=anndata_pair.embed_key,
+        )
+    return initialize_de_comparison(real=real_frame, pred=pred_frame), anndata_pair
 
 
 def _build_pdex_kwargs(
